@@ -32,15 +32,15 @@ constexpr uint16_t _ADC_TRIGGER_ADVANCE_TICKS = 48;
 
 // -------------------- Control constants --------------------
 
-constexpr float _MIN_DUTY = 0.10f;  // That motor looks unhappy below 10% duty
-constexpr float _MAX_DUTY = 0.99f;
+constexpr float _MIN_DUTY = 0.10f;  // This motor is not happy below ~10% duty
+constexpr float _MAX_DUTY = 0.99f;  // Also limit the max to 99%
 constexpr float _DUTY_STEP_SMALL = 0.01f; // 1% duty step for fine manual adjustment
 constexpr float _DUTY_STEP_LARGE = 0.10f; // 10% duty step for coarse manual adjustment
 
-constexpr uint32_t _PRINT_PERIOD_MS = 1000; // Print status every 1 second
+constexpr uint32_t _PRINT_PERIOD_MS = 500; // Print status periodically
 constexpr uint8_t _CONTROL_CYCLES = 10; // Number of PWM cycles to average before updating the control loop
 
-float _dutyCmd1 = 0.25f;  // Reasonable default duty
+float _dutySp = 0.25f;  // Reasonable default duty SP (scaled 0 to 1)
 
 // Control mode. Open loop by default
 enum class Mode : uint8_t
@@ -50,24 +50,23 @@ enum class Mode : uint8_t
 };
 Mode _controlMode = Mode::OPEN_LOOP;
 
-// -------------------- ADC globals --------------------
 
+// -------------------- ADC globals --------------------
+// These are updated in the ADC ISR and read in the main loop
 volatile uint32_t _adcRawAverageSum = 0;  // Accumulates raw ADC samples for averaging
 volatile uint8_t _adcRawAverageCount = 0;
 volatile uint16_t _adcRawAverageForLoop = 0;
 volatile bool _adcRawAverageReady = false;  // Let the main loop know when a new averaged ADC sample is ready
+float _currentA = 0.0f; // Scaled current in Amps calculated from the latest ADC average
 
-uint32_t _lastPrintMs = 0;
-float _currentSampleA = 0.0f;
-float _point1Duty = 0.0f;
+// Correction variables
+float _point1Duty = 0.10f;
 float _point1CurrentA = 0.100f;
-float _point2Duty = 0.0f;
-float _point2CurrentA = 0.0f;
 float _dutyCorrectionPerAmp = 4.2f;
-bool _point1Stored = false;
-bool _correctionReady = false;
 
-// -------------------- PWM setup --------------------
+// Keep track of the last print time
+uint32_t _lastPrintMs = 0;
+
 
 // Updates the PWM duty register and aligns the ADC trigger to the on-time midpoint.
 void setPwmDuty(float duty_1)
@@ -92,27 +91,46 @@ void setPwmDuty(float duty_1)
 }
 
 
-// Calculates the closed-loop duty target from the manual setpoint and upward-only current correction.
-float calculateClosedLoopDutyTarget()
+// Writes the latest operating values to the VFD over Serial1.
+void updateVfdDisplay(Mode mode, float currentA, float dutySp, float dutyClosedLoopOut)
 {
-  float dutyTarget_1 = _dutyCmd1;
-  float correctionCurrentA = max(0.0f, _currentSampleA - _point1CurrentA);
+  Serial1.write(0x0C);  // Cursor home
+  Serial1.print("\r\n");  // Clearing display is flicery, just shift old text out
+  Serial1.print("\r\n");
 
-  dutyTarget_1 += _dutyCorrectionPerAmp * correctionCurrentA;
+  // Print mode and current
+  Serial1.print("M:");
+  switch (mode)
+  {
+    case Mode::OPEN_LOOP:
+      Serial1.print("OPEN  ");
+      break;
 
-  return dutyTarget_1;
+    case Mode::CLOSED_LOOP:
+      Serial1.print("CLOSED");
+      break;
+  }
+  Serial1.print(" | I:");
+  Serial1.print(currentA, 3);
+  Serial1.print("A");
+
+  // Next line are duty cycles
+  Serial1.print("\r\n");
+  Serial1.print("SP:");
+  Serial1.print(dutySp * 100.0f, 0);
+  Serial1.print("%   | Out:");
+  Serial1.print(dutyClosedLoopOut * 100.0f, 0);
+  Serial1.print("%");
 }
 
 
 // Stores the no-load calibration point from open-loop duty and current sample.
 void storeCalibrationPoint1()
 {
-  _point1Duty = _dutyCmd1;
-  _point1CurrentA = _currentSampleA;
-  _point1Stored = true;
-  _correctionReady = false;
+  _point1Duty = _dutySp;
+  _point1CurrentA = _currentA;
 
-  Serial.print("point1: duty=");
+  Serial.print("Set Point 1: duty=");
   Serial.print(_point1Duty * 100.0f, 1);
   Serial.print("%  I=");
   Serial.print(_point1CurrentA, 3);
@@ -123,85 +141,19 @@ void storeCalibrationPoint1()
 // Stores the load calibration point and calculates the duty correction per amp.
 void storeCalibrationPoint2()
 {
-  float currentDeltaA = 0.0f;
-  float dutyDelta = 0.0f;
+  float currentDeltaA = _currentA - _point1CurrentA;
+  float dutyDelta = _dutySp - _point1Duty;
 
-
-  _point2Duty = _dutyCmd1;
-  _point2CurrentA = _currentSampleA;
-  currentDeltaA = _point2CurrentA - _point1CurrentA;
-  dutyDelta = _point2Duty - _point1Duty;
-
+  // Calcualte correction factor in PWM duty per Amp 
   _dutyCorrectionPerAmp = dutyDelta / currentDeltaA;
-  _correctionReady = true;
 
-  Serial.print("point2: duty=");
-  Serial.print(_point2Duty * 100.0f, 1);
+  Serial.print("Set Point 2: duty=");
+  Serial.print(_dutySp * 100.0f, 1);
   Serial.print("%  I=");
-  Serial.print(_point2CurrentA, 3);
+  Serial.print(_currentA, 3);
   Serial.print("A  corr=");
   Serial.print(_dutyCorrectionPerAmp, 4);
   Serial.println(" duty/A");
-}
-
-
-// Applies one serial command according to the active control mode.
-void processCommand(char cmd_1)
-{
-  switch (cmd_1)
-  {
-    case 'o':
-      _controlMode = Mode::OPEN_LOOP;
-      Serial.println("mode=OPEN");
-      break;
-
-    case 'c':
-      _controlMode = Mode::CLOSED_LOOP;
-      Serial.println("mode=CLOSED");
-      break;
-
-    case 'w':
-      _dutyCmd1 = constrain(_dutyCmd1 + _DUTY_STEP_SMALL, _MIN_DUTY, _MAX_DUTY);
-      break;
-
-    case 'W':
-      _dutyCmd1 = constrain(_dutyCmd1 + _DUTY_STEP_LARGE, _MIN_DUTY, _MAX_DUTY);
-      break;
-
-    case 's':
-      _dutyCmd1 = constrain(_dutyCmd1 - _DUTY_STEP_SMALL, _MIN_DUTY, _MAX_DUTY);
-      break;
-
-    case 'S':
-      _dutyCmd1 = constrain(_dutyCmd1 - _DUTY_STEP_LARGE, _MIN_DUTY, _MAX_DUTY);
-      break;
-
-    case '1':
-      switch (_controlMode)
-      {
-        case Mode::OPEN_LOOP:
-          storeCalibrationPoint1();
-          break;
-
-        case Mode::CLOSED_LOOP:
-          Serial.println("point1: use OPEN mode");
-          break;
-      }
-      break;
-
-    case '2':
-      switch (_controlMode)
-      {
-        case Mode::OPEN_LOOP:
-          storeCalibrationPoint2();
-          break;
-
-        case Mode::CLOSED_LOOP:
-          Serial.println("point2: use OPEN mode");
-          break;
-      }
-      break;
-  }
 }
 
 
@@ -209,6 +161,12 @@ void processCommand(char cmd_1)
 void setup()
 {
   Serial.begin(115200);
+
+  // VFD display on Serial1 at 19200 baud
+  Serial1.begin(19200);
+  Serial1.write(0x16);  // Hide cursor
+  Serial1.write(0x0E);  // Clear display
+  Serial1.write(0x0C);  // Cursor home
 
   Serial.println("Setup starting...");
 
@@ -228,8 +186,8 @@ void setup()
   TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS10); // prescaler = 1
   TIMSK1 = (1 << OCIE1B);
 
-  _dutyCmd1 = constrain(_dutyCmd1, _MIN_DUTY, _MAX_DUTY);
-  setPwmDuty(_dutyCmd1);
+  _dutySp = constrain(_dutySp, _MIN_DUTY, _MAX_DUTY);
+  setPwmDuty(_dutySp);
 
   // ADC0 / A0
   // Internal 1.1V reference on ATmega2560:
@@ -282,53 +240,100 @@ void loop()
   _adcRawAverageReady = false;
   interrupts();
 
-  _currentSampleA = (_adcRaw * _ADC_VOLTS_PER_COUNT) / _SHUNT_OHMS;
-
-  uint32_t now = millis();
+  _currentA = (_adcRaw * _ADC_VOLTS_PER_COUNT) / _SHUNT_OHMS;
 
   if (Serial.available())
   {
     char cmd = Serial.read();
-    processCommand(cmd);
+    switch (cmd)
+    {
+      case 'o':
+        _controlMode = Mode::OPEN_LOOP;
+        Serial.println("Set Mode=OPEN_LOOP");
+        break;
+
+      case 'c':
+        _controlMode = Mode::CLOSED_LOOP;
+        Serial.println("Set Mode=CLOSED");
+        break;
+
+      case 'w':
+        _dutySp = constrain(_dutySp + _DUTY_STEP_SMALL, _MIN_DUTY, _MAX_DUTY);
+        break;
+
+      case 'W':
+        _dutySp = constrain(_dutySp + _DUTY_STEP_LARGE, _MIN_DUTY, _MAX_DUTY);
+        break;
+
+      case 's':
+        _dutySp = constrain(_dutySp - _DUTY_STEP_SMALL, _MIN_DUTY, _MAX_DUTY);
+        break;
+
+      case 'S':
+        _dutySp = constrain(_dutySp - _DUTY_STEP_LARGE, _MIN_DUTY, _MAX_DUTY);
+        break;
+
+      case '1':
+        storeCalibrationPoint1();
+        break;
+
+      case '2':
+        storeCalibrationPoint2();
+        break;
+    }
   }
 
+  float dutyClosedLoopOut = 0.0f;
   switch (_controlMode)
   {
     case Mode::OPEN_LOOP:
-      _dutyCmd1 = constrain(_dutyCmd1, _MIN_DUTY, _MAX_DUTY);
-      setPwmDuty(_dutyCmd1);
+      _dutySp = constrain(_dutySp, _MIN_DUTY, _MAX_DUTY);
+      setPwmDuty(_dutySp);
       break;
 
     case Mode::CLOSED_LOOP:
-      setPwmDuty(calculateClosedLoopDutyTarget());
+      // Limit the correction to the positive side only
+      float correctionCurrentA = max(0.0f, _currentA - _point1CurrentA);
+      dutyClosedLoopOut = _dutySp + _dutyCorrectionPerAmp * correctionCurrentA;
+      dutyClosedLoopOut = constrain(dutyClosedLoopOut, _MIN_DUTY, _MAX_DUTY);
+      setPwmDuty(dutyClosedLoopOut);
       break;
   }
 
+  // Print the latest status periodically
+  uint32_t now = millis();
   if (now - _lastPrintMs < _PRINT_PERIOD_MS)
   {
     return;
   }
-
   _lastPrintMs = now;
+
+  // Update the VFD display first
+  updateVfdDisplay(_controlMode, _currentA, _dutySp, dutyClosedLoopOut);
+  
+  // Now print some status to the console
   Serial.print("I=");
-  Serial.print(_currentSampleA, 3);
-  Serial.print("A, duty_sp=");
-  Serial.print(_dutyCmd1 * 100.0f, 1);
-  Serial.print(", corr=");
-  Serial.print(_dutyCorrectionPerAmp, 4);
-  Serial.print(" duty/A, p1_I=");
+  Serial.print(_currentA, 3);
+  Serial.print("A, Duty SP=");
+  Serial.print(_dutySp * 100.0f, 1);
+  Serial.print("%, Corr=");
+  Serial.print(_dutyCorrectionPerAmp, 2);
+  Serial.print("duty/A, p1_I=");
   Serial.print(_point1CurrentA, 3);
-  Serial.print("A, p1_duty=");
-  Serial.print(_point1Duty * 100.0f, 1);
-  Serial.print(" , mode=");
+  Serial.print("A, mode=");
   switch (_controlMode)
   {
     case Mode::OPEN_LOOP:
-      Serial.println("OPEN LOOP");
+      Serial.println("OPEN_LOOP");
       break;
 
     case Mode::CLOSED_LOOP:
-      Serial.println("CLOSED LOOP");
+      Serial.print("CLOSED_LOOP");
+
+      // Print target in closed loop mode
+      Serial.print(", Duty Out=");
+      Serial.print(dutyClosedLoopOut * 100.0f, 1);
+      Serial.println("%");
       break;
   }
 }
